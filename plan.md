@@ -7,80 +7,91 @@ A standalone MVP application where:
 2. System processes it (Kreuzberg clean → chunk → embed) in the background
 3. User sees live processing status (Queued / Processing / Ready / Failed)
 4. When Ready, user clicks "Analyze" — system runs RAG extraction with local Ollama
-5. Extracted fields are stored in DB and displayed in UI
+5. Extracted fields (fixed + dynamic + supplier-specific) are stored in DB and shown in UI
 
-No cloud LLMs. Everything runs locally.
+No cloud LLMs. Everything is local. Ollama runs on a remote server we own.
+
+---
+
+## Ollama Server
+
+```
+Base URL: http://148.113.1.127:11434
+Embed model: nomic-embed-text     (768 dims)
+Generation model: gpt-oss         (verify exact name via GET /api/tags)
+```
+
+To verify available models:
+```bash
+curl http://148.113.1.127:11434/api/tags
+```
 
 ---
 
 ## Tech Stack
 
-| Layer | Choice | Reason |
-|-------|--------|--------|
-| Backend | FastAPI (Python) | Kreuzberg is Python-native |
-| Document cleaning | kreuzberg | Local PDF/DOCX text extraction |
-| Chunking | langchain `RecursiveCharacterTextSplitter` | Simple, reliable |
-| Embeddings | Ollama `nomic-embed-text` (768 dims) | Free, local, good quality |
-| LLM generation | Ollama `llama3.2` | Local, no API cost |
-| Database | PostgreSQL + pgvector | Vector search for RAG |
-| ORM | SQLAlchemy + asyncpg | Async Python DB |
-| Background jobs | FastAPI `BackgroundTasks` | No Redis needed for MVP |
-| Frontend | Next.js (or plain React + Vite) | UI with polling |
-
----
-
-## Ollama Setup (prerequisite)
-
-```bash
-ollama pull nomic-embed-text   # 768-dim embeddings
-ollama pull llama3.2           # generation (or llama3.1:8b for better quality)
-```
+| Layer | Choice |
+|-------|--------|
+| Backend | FastAPI (Python) — Kreuzberg is Python-native |
+| Document cleaning | kreuzberg |
+| Chunking | langchain `RecursiveCharacterTextSplitter` |
+| Embeddings | Ollama `nomic-embed-text` via HTTP |
+| LLM generation | Ollama `gpt-oss` via HTTP |
+| Database | PostgreSQL + pgvector |
+| ORM | SQLAlchemy + asyncpg |
+| Background tasks | FastAPI `BackgroundTasks` (no Redis needed for MVP) |
+| Frontend | Next.js |
 
 ---
 
 ## Database Schema (3 tables)
 
 ### `documents`
-| Column | Type | Description |
-|--------|------|-------------|
+
+| Column | Type | Notes |
+|--------|------|-------|
 | id | UUID PK | |
 | filename | TEXT | original filename |
 | mime_type | TEXT | application/pdf etc |
 | status | TEXT | QUEUED / PROCESSING / READY / FAILED |
 | progress | INT | 0–100 |
-| error_message | TEXT nullable | failure reason |
+| error_message | TEXT nullable | |
 | raw_text | TEXT nullable | cleaned text from Kreuzberg |
 | created_at | TIMESTAMP | |
 | updated_at | TIMESTAMP | |
 
 ### `chunks`
-| Column | Type | Description |
-|--------|------|-------------|
+
+| Column | Type | Notes |
+|--------|------|-------|
 | id | UUID PK | |
-| document_id | UUID FK → documents.id | |
-| chunk_index | INT | order in document |
+| document_id | UUID FK | → documents.id |
+| chunk_index | INT | order in doc |
 | content | TEXT | chunk text |
-| page_start | INT nullable | citation |
-| page_end | INT nullable | citation |
+| page_start | INT nullable | for citations |
+| page_end | INT nullable | for citations |
 | section_title | TEXT nullable | heading if detected |
 | metadata | JSONB nullable | extra info |
-| embedding | vector(768) | pgvector embedding |
+| embedding | vector(768) | pgvector |
 
-Index:
+Required index:
 ```sql
 CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ```
 
 ### `document_analysis`
-| Column | Type | Description |
-|--------|------|-------------|
+
+| Column | Type | Notes |
+|--------|------|-------|
 | id | UUID PK | |
-| document_id | UUID FK → documents.id UNIQUE | one result per doc |
+| document_id | UUID FK UNIQUE | → documents.id (one result per doc) |
 | status | TEXT | PENDING / RUNNING / DONE / FAILED |
 | error_message | TEXT nullable | |
-| result | JSONB nullable | extracted fields JSON |
-| sources | JSONB nullable | chunk citations |
-| model_name | TEXT | ollama model used |
+| fixed_fields | JSONB nullable | 20 extracted fields |
+| dynamic_fields | JSONB nullable | categorical clauses |
+| special_fields | JSONB nullable | supplier-specific fields |
+| sources | JSONB nullable | chunk citations per field group |
+| model_name | TEXT | which Ollama model was used |
 | created_at | TIMESTAMP | |
 | updated_at | TIMESTAMP | |
 
@@ -91,38 +102,38 @@ CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosi
 ```
 mait-mvp/
 ├── backend/
-│   ├── main.py                  # FastAPI app entry point
-│   ├── database.py              # SQLAlchemy engine + session
-│   ├── models.py                # SQLAlchemy models (3 tables)
-│   ├── schemas.py               # Pydantic request/response schemas
+│   ├── main.py
+│   ├── database.py          # SQLAlchemy async engine + session
+│   ├── models.py            # 3 SQLAlchemy models
+│   ├── schemas.py           # Pydantic request/response models
+│   ├── config.py            # env vars (OLLAMA_BASE_URL, DB URL, models)
 │   ├── routers/
-│   │   ├── documents.py         # upload, status, list endpoints
-│   │   └── analysis.py          # analyze, get-result endpoints
+│   │   ├── documents.py     # upload, list, status
+│   │   └── analysis.py     # analyze, get-result
 │   ├── services/
-│   │   ├── ingestion.py         # Kreuzberg clean → chunk → embed → store
-│   │   ├── embedding.py         # Ollama embed calls
-│   │   └── extraction.py        # RAG retrieval + Ollama generation
-│   ├── prompts.py               # extraction prompt templates + field definitions
+│   │   ├── ingestion.py    # Kreuzberg → chunk → embed → store
+│   │   ├── embedding.py    # Ollama embed calls
+│   │   └── extraction.py  # RAG retrieval + Ollama generation (3 passes)
+│   ├── prompts.py           # ALL prompt templates (copied from ContractAIService.ts)
 │   └── requirements.txt
 ├── frontend/
-│   ├── (Next.js or Vite React app)
 │   └── src/
-│       ├── pages/ (or app/)
-│       │   ├── index.tsx         # documents list with status
-│       │   └── analysis/[id].tsx # analysis result view
+│       ├── app/
+│       │   ├── page.tsx               # documents list
+│       │   └── documents/[id]/page.tsx # analysis result
 │       └── components/
 │           ├── DocumentList.tsx
 │           ├── StatusBadge.tsx
 │           └── AnalysisResult.tsx
-├── docker-compose.yml           # postgres + pgvector only
-└── plan.md                      # this file
+├── docker-compose.yml       # postgres + pgvector only
+└── plan.md
 ```
 
 ---
 
 ## Implementation Steps
 
-### Step 1 — Postgres + pgvector
+### Step 1 — Docker: Postgres + pgvector
 
 `docker-compose.yml`:
 ```yaml
@@ -137,19 +148,25 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-
 volumes:
   pgdata:
 ```
 
-Run:
 ```bash
 docker compose up -d
 ```
 
 ---
 
-### Step 2 — Backend Setup
+### Step 2 — Backend Config
+
+`backend/.env`:
+```
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/mait_mvp
+OLLAMA_BASE_URL=http://148.113.1.127:11434
+EMBED_MODEL=nomic-embed-text
+GENERATION_MODEL=gpt-oss
+```
 
 `requirements.txt`:
 ```
@@ -158,8 +175,7 @@ uvicorn[standard]
 sqlalchemy[asyncio]
 asyncpg
 pgvector
-kreuzberg
-langchain
+kreuzberg[ocr]
 langchain-text-splitters
 httpx
 python-multipart
@@ -167,194 +183,316 @@ python-dotenv
 alembic
 ```
 
-`backend/.env`:
-```
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/mait_mvp
-OLLAMA_BASE_URL=http://localhost:11434
-EMBED_MODEL=nomic-embed-text
-GENERATION_MODEL=llama3.2
-```
-
 ---
 
-### Step 3 — Database Models (`models.py`)
+### Step 3 — Database Init
 
-```python
-from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-from pgvector.sqlalchemy import Vector
-import uuid, datetime
+Run migrations with Alembic or just use SQLAlchemy `create_all` for MVP.
 
-class Document(Base):
-    __tablename__ = "documents"
-    id = Column(UUID, primary_key=True, default=uuid.uuid4)
-    filename = Column(String, nullable=False)
-    mime_type = Column(String)
-    status = Column(String, default="QUEUED")  # QUEUED|PROCESSING|READY|FAILED
-    progress = Column(Integer, default=0)
-    error_message = Column(Text)
-    raw_text = Column(Text)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, onupdate=datetime.datetime.utcnow)
-
-class Chunk(Base):
-    __tablename__ = "chunks"
-    id = Column(UUID, primary_key=True, default=uuid.uuid4)
-    document_id = Column(UUID, ForeignKey("documents.id"))
-    chunk_index = Column(Integer)
-    content = Column(Text)
-    page_start = Column(Integer)
-    page_end = Column(Integer)
-    section_title = Column(Text)
-    metadata = Column(JSONB)
-    embedding = Column(Vector(768))
-
-class DocumentAnalysis(Base):
-    __tablename__ = "document_analysis"
-    id = Column(UUID, primary_key=True, default=uuid.uuid4)
-    document_id = Column(UUID, ForeignKey("documents.id"), unique=True)
-    status = Column(String, default="PENDING")  # PENDING|RUNNING|DONE|FAILED
-    error_message = Column(Text)
-    result = Column(JSONB)
-    sources = Column(JSONB)
-    model_name = Column(String)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, onupdate=datetime.datetime.utcnow)
+Raw SQL for pgvector:
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 ---
 
 ### Step 4 — Ingestion Service (`services/ingestion.py`)
 
-Called as a background task after upload.
+Triggered as `BackgroundTasks` task after upload.
 
 ```
-async def ingest_document(document_id: str, file_bytes: bytes, filename: str):
-    1. Update status → PROCESSING, progress = 5
-    2. Use kreuzberg to extract clean text from file_bytes
-       - result = await kreuzberg.extract_text(file_bytes, mime_type)
-       - Store in documents.raw_text
-    3. Update progress = 30
-    4. Chunk the raw_text using RecursiveCharacterTextSplitter
-       - chunk_size=800, chunk_overlap=80
-    5. Update progress = 50
-    6. For each chunk:
-       - Call Ollama embed: POST /api/embeddings { model, prompt: chunk_text }
-       - Insert row into chunks table with embedding vector
-    7. Update progress = 90
-    8. status → READY, progress = 100
-    On any exception: status → FAILED, error_message = str(e)
+async def ingest_document(document_id, file_bytes, filename, mime_type):
+    try:
+        1. db: set status=PROCESSING, progress=5
+        2. kreuzberg: extract clean text from file_bytes
+           - result = await kreuzberg.extract_text_from_bytes(file_bytes, mime_type)
+           - store result.text in documents.raw_text
+        3. db: progress=30
+        4. chunk: RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
+           - chunks = splitter.split_text(raw_text)
+        5. db: progress=50
+        6. delete existing chunks for document_id (idempotency)
+        7. for each chunk:
+           - embedding = await embed(chunk_text)  # Ollama nomic-embed-text
+           - insert row into chunks table
+        8. db: progress=90
+        9. db: status=READY, progress=100
+    except Exception as e:
+        db: status=FAILED, error_message=str(e)
 ```
 
 ---
 
-### Step 5 — Extraction Service (`services/extraction.py`)
-
-Called when user clicks "Analyze".
-
-```
-async def analyze_document(document_id: str):
-    1. Upsert document_analysis row: status = RUNNING
-    2. For each field group (3 groups, see below):
-       a. Build query string for the group
-       b. Embed query via Ollama
-       c. pgvector similarity search:
-          SELECT * FROM chunks
-          WHERE document_id = :id
-          ORDER BY embedding <-> :query_vec
-          LIMIT 10
-       d. Pack chunk texts into context
-       e. Call Ollama generate with prompt (see prompts.py)
-       f. Parse JSON response
-    3. Merge all group results into one JSON object
-    4. Store in document_analysis.result + sources
-    5. status → DONE
-    On error: status → FAILED
-```
-
-**Field groups + query strings:**
-- Group A (identity): `"agreement type parties client supplier provider product"` → fields: agreement_type, provider, client, product, contract_id, contract_classification
-- Group B (financials + dates): `"start date end date payment terms total amount annual value contract term"` → fields: start_date, end_date, contract_term, contract_status, total_amount, annual_amount, payment_terms
-- Group C (renewal + ownership): `"auto renewal notice period renewal duration customer owner supplier owner relationships"` → fields: auto_renewal, renewal_notice_period, renewal_duration_period, relationships, customer_owner, supplier_owner
-
----
-
-### Step 6 — Prompts (`prompts.py`)
-
-One prompt template per group. Example for Group B:
+### Step 5 — Embedding Service (`services/embedding.py`)
 
 ```python
-SYSTEM_PROMPT = """You are a contract analysis assistant.
-Use ONLY the provided context chunks from the contract.
-If a field is not found in the context, return null for that field.
-Return ONLY valid JSON. No explanation, no markdown."""
-
-GROUP_B_PROMPT = """Extract the following fields from the contract context below.
-
-Fields to extract:
-- start_date: Contract start date (YYYY-MM-DD format)
-- end_date: Contract end date (YYYY-MM-DD format)
-- contract_term: Duration e.g. "24 months"
-- contract_status: "Active", "Inactive", or "Unknown"
-- total_amount: Format as "CURRENCY_CODE:AMOUNT" e.g. "USD:150000.00"
-- annual_amount: Year-by-year breakdown or calculated annual rate
-- payment_terms: Format as "X Days | Advanced" or "X Days | Arrears"
-
-Return JSON:
-{
-  "start_date": {"value": "...", "confidence": 0.0-1.0},
-  "end_date": {"value": "...", "confidence": 0.0-1.0},
-  ...
-}
-
-Context:
-{context}
-"""
+async def embed(text: str) -> list[float]:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": text},
+            timeout=30
+        )
+    return response.json()["embedding"]
 ```
 
-(Adapt field definitions directly from `ContractAIService.ts` lines 362–390 in the multistrat project)
+Store vector in Postgres using pgvector raw SQL (SQLAlchemy `execute`):
+```python
+await db.execute(
+    text('UPDATE chunks SET embedding = :emb::vector WHERE id = :id'),
+    {"emb": f"[{','.join(map(str, embedding))}]", "id": chunk_id}
+)
+```
 
 ---
 
-### Step 7 — API Endpoints (`routers/documents.py`, `routers/analysis.py`)
+### Step 6 — Extraction Service (`services/extraction.py`)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/documents` | Upload file → 202, starts background ingestion |
-| GET | `/documents` | List all documents with status |
-| GET | `/documents/{id}` | Single document status + progress |
-| POST | `/documents/{id}/analyze` | Start RAG extraction → 202 |
-| GET | `/documents/{id}/analysis` | Get analysis result |
+Three sequential passes when user clicks "Analyze":
+
+```
+async def analyze_document(document_id):
+    1. upsert document_analysis: status=RUNNING
+    2. fetch document.raw_text (used in context + for the supplier detection)
+    3. run Pass 1 (fixed fields)
+    4. run Pass 2 (dynamic fields)
+    5. run Pass 3 (supplier/special fields)
+    6. merge results, store in document_analysis
+    7. status=DONE
+    on error: status=FAILED
+```
+
+**For each pass:**
+```
+query_text = <field-group-specific query string>
+query_embedding = await embed(query_text)
+chunks = pgvector SELECT top 10 by cosine similarity WHERE document_id=:id
+context = join chunk contents
+response = await ollama_generate(prompt_template.format(context=context))
+result = parse_json(response)
+```
+
+pgvector retrieval SQL:
+```sql
+SELECT id, content, metadata
+FROM chunks
+WHERE document_id = :doc_id
+ORDER BY embedding <-> :query_vec::vector
+LIMIT 10
+```
+
+Ollama generate call:
+```python
+async def ollama_generate(prompt: str) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": GENERATION_MODEL, "prompt": prompt, "stream": False, "format": "json"},
+            timeout=120
+        )
+    return response.json()["response"]
+```
 
 ---
 
-### Step 8 — Frontend
+### Step 7 — Prompts (`prompts.py`)
 
-**Documents list page (`/`)**:
-- Table columns: Filename, Uploaded At, Status badge, Progress bar, Action button
-- Status badge colors: QUEUED=gray, PROCESSING=yellow, READY=green, FAILED=red
-- Poll `GET /documents` every 3s while any doc is QUEUED or PROCESSING
-- Action button: disabled unless READY → "Analyze" → POST `/documents/{id}/analyze` → poll analysis
-
-**Analysis result page (`/documents/[id]/analysis`)**:
-- Show extracted fields in a card layout
-- Each field: label + value + confidence score (as colored dot: green > 0.8, yellow > 0.5, red otherwise)
-- Show source chunks (citations) at bottom
+**Source**: All prompts are adapted directly from
+`/Users/pushpendersharma/Documents/multistrat/backend/src/api/services/ContractAIService.ts`
 
 ---
 
-## API Response Shapes
+#### PASS 1: Fixed Fields
+
+**Retrieval query strings** (3 pgvector searches, merge top 10 from each):
+- `"contract parties provider client supplier product agreement type"`
+- `"start date end date payment terms total amount annual value contract term"`
+- `"auto renewal notice period renewal duration owner relationships contract id"`
+
+**Prompt** (adapted from ContractAIService.ts lines 351–540):
+
+```
+You are an expert contract analysis system. Extract ONLY the following 20 fixed fields.
+
+FIXED FIELDS:
+1. agreement_type - standardized abbreviations: MSA, NDA, SOW, PO, SLA, DPA, BAA, EULA, SCHEDULE, INVOICE, ORDER, etc.
+2. provider - service/product provider company name (supplier/vendor)
+3. client - customer/client company name
+4. product - primary product or service being contracted
+5. total_amount - format "CURRENCY_CODE:AMOUNT" e.g. "USD:150000.00". Exclude taxes/VAT.
+6. annual_amount - year-by-year breakdown or calculated. Format "Year 1: USD:X, Year 2: USD:Y". "N/A" if undetermined.
+7. start_date - YYYY-MM-DD format
+8. end_date - YYYY-MM-DD format
+9. contract_id - unique identifier, contract number, reference number
+10. contract_classification - one of: SAAS|IAAS|PAAS|PROFESSIONAL_SERVICES|MANAGED_SERVICES|HARDWARE|RESELLER|NETWORK|OTHER
+11. contract_status - "Active" if currently in effect, "Inactive" if expired/not started, "Unknown" if unclear
+12. contract_term - e.g. "24 months". Calculate from dates if not stated. "N/A" if cannot determine.
+13. payment_terms - format "X Days | Advanced" or "X Days | Arrears". e.g. "30 Days | Arrears". Default timing to Arrears if only duration given. "N/A" if not specified.
+14. auto_renewal - "Yes" or "No". Default "No" if unclear.
+15. renewal_notice_period - format "X months" only. e.g. "3 months". Convert days: 30d=1mo, 60d=2mo, 90d=3mo. ONLY the period to prevent auto-renewal, NOT general termination notice. "N/A" if not specified.
+16. renewal_duration_period - format "X months" only. Duration of each renewal cycle. "N/A" if auto_renewal=No or not stated.
+17. relationships - comma-separated references to other documents mentioned. "N/A" if none.
+18. customer_owner - person who owns agreement on client side. Format "Name (Contact Info)" if available. "N/A" if not found.
+19. supplier_owner - person who owns agreement on supplier side. Format "Name (Contact Info)" if available. "N/A" if not found.
+20. original_filename - the uploaded document filename
+
+CONFIDENCE SCORING (weighted):
+- OCR Quality (31%): 0.9-1.0 clear text, 0.7-0.9 minor artifacts, 0.5-0.7 some errors, 0.3-0.5 poor, 0.1-0.3 severe
+- Contradiction Check (28%): 0.9-1.0 no contradiction, 0.7-0.9 minor, 0.5-0.7 moderate, 0.3-0.5 significant, 0.1-0.3 major
+- Inference Level (23%): 0.9-1.0 explicit, 0.7-0.9 mostly explicit, 0.5-0.7 interpreted, 0.3-0.5 assumed, 0.1-0.3 speculative
+- Expected Location (18%): 0.9-1.0 standard section, 0.7-0.9 related section, 0.5-0.7 unusual, 0.3-0.5 very unusual
+- Formula: (OCR×0.31) + (Contradiction×0.28) + (Inference×0.23) + (Location×0.18), round to 2 decimals
+
+Return ONLY valid JSON:
+{
+  "fixed_fields": {
+    "agreement_type": { "value": "...", "description": "...", "confidence": 0.0 },
+    "provider": { "value": "...", "description": "...", "confidence": 0.0 },
+    ... (all 20 fields)
+  }
+}
+
+Context from contract:
+{context}
+```
+
+---
+
+#### PASS 2: Dynamic Fields
+
+**Retrieval query string**:
+`"contract clauses terms conditions liability data protection payment commercial legal use restrictions"`
+
+**Prompt** (adapted from ContractAIService.ts lines 693–827):
+
+```
+You are an expert contract analysis system. Extract ONLY dynamic contract-specific fields organized into categories. Do NOT extract the 20 fixed fields.
+
+Extract EVERY relevant clause and organize into:
+
+- Use rights & restrictions: usage limits, access restrictions, permitted/prohibited uses, geographic restrictions, feature restrictions
+- General: SLAs, performance metrics, uptime, support levels, maintenance, delivery timelines, force majeure, insurance, business continuity, auto-renewal provisions, transition requirements. ALWAYS include "contract_description" here.
+- Legal terms: liability limitations, indemnification, confidentiality periods, GDPR/privacy compliance, governing law, jurisdiction, dispute resolution, IP rights, warranties
+- Commercial terms: payment schedules, billing frequency, late fees, pricing models, cost escalation, discounts, credits, service level credits
+- Data protection: data privacy, retention policies, data transfer restrictions, breach notification, encryption, data deletion obligations
+
+MANDATORY: Always include "contract_description" in General:
+- value: Comprehensive description of the contract — purpose, scope, key obligations, deliverables, business context
+- description: "Detailed contract description with supporting information"
+- confidence: 0.0-1.0
+
+EXTRACTION RULES:
+- Only extract when 95%+ confident the clause genuinely exists
+- Must have significant business impact (time, cost, obligation, legal risk)
+- Must be explicitly stated, not implied
+- Do NOT extract vague references or boilerplate without specifics
+- For monetary values always use "CURRENCY:AMOUNT" format
+
+Return ONLY valid JSON:
+{
+  "dynamic_fields": {
+    "Use rights & restrictions": {
+      "field_name": { "value": "...", "description": "...", "confidence": 0.0 }
+    },
+    "General": {
+      "contract_description": { "value": "...", "description": "Detailed contract description", "confidence": 0.0 }
+    },
+    "Legal terms": {},
+    "Commercial terms": {},
+    "Data protection": {}
+  }
+}
+
+Context from contract:
+{context}
+```
+
+---
+
+#### PASS 3: Special / Supplier Fields
+
+**Retrieval query string**: Built dynamically based on supplier name.
+- Oracle: `"oracle license entitlement metric ULA CSI support level"`
+- Microsoft: `"microsoft license EA enrollment product terms Azure"`
+- SAP: `"SAP license user type named user engine metrics"`
+- Generic fallback: `"software license entitlement terms usage metric support"`
+
+**Prompt** (adapted from SupplierMappingService pattern):
+
+After detecting the supplier from fixed_fields.provider (Pass 1 result), build a targeted prompt:
+
+```
+You are an expert contract analysis system specializing in {SUPPLIER_NAME} contracts.
+Extract the following supplier-specific fields from the contract.
+
+Fields to extract:
+{SUPPLIER_FIELD_LIST}  ← from mapping.json in the multistrat project
+
+Each field: { "value": "...", "description": "...", "confidence": 0.0 }
+Return null for fields not found.
+
+Return ONLY valid JSON:
+{
+  "special_fields": {
+    "{SUPPLIER_NAME}": {
+      "{category}": {
+        "field_name": { "value": "...", "description": "...", "confidence": 0.0 }
+      }
+    }
+  }
+}
+
+Context from contract:
+{context}
+```
+
+For MVP, copy the field definitions from:
+`/Users/pushpendersharma/Documents/multistrat/backend/src/data/mapping.json`
+
+If supplier is not recognized → skip Pass 3, return empty `special_fields: {}`.
+
+---
+
+### Step 8 — API Endpoints
+
+**`routers/documents.py`**:
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| POST | `/documents` | multipart file | `202 { document_id, status: "QUEUED" }` |
+| GET | `/documents` | — | list of documents with status |
+| GET | `/documents/{id}` | — | single doc with status + progress |
+
+**`routers/analysis.py`**:
+
+| Method | Path | Response |
+|--------|------|----------|
+| POST | `/documents/{id}/analyze` | `202 { message: "Analysis started" }` |
+| GET | `/documents/{id}/analysis` | analysis result JSON |
+
+---
+
+### Step 9 — Frontend (Next.js)
+
+**Documents List (`/`)**:
+- Table: Filename | Uploaded | Status badge | Progress % | Action
+- Status badge colors: QUEUED=gray, PROCESSING=amber, READY=green, FAILED=red
+- While any doc is QUEUED or PROCESSING: poll `GET /documents` every 3 seconds
+- "Analyze" button: enabled only when READY → POST `/documents/{id}/analyze` → navigate to result page
+
+**Analysis Result (`/documents/[id]`)**:
+- Three sections: Fixed Fields, Dynamic Fields (by category), Special Fields
+- Each field row: Label | Value | Confidence dot (green ≥0.8, yellow ≥0.5, red <0.5)
+- Source chunks shown at bottom as collapsible citations
+
+---
+
+## Response Shapes
 
 ### `GET /documents`
 ```json
 [
-  {
-    "id": "uuid",
-    "filename": "contract.pdf",
-    "status": "READY",
-    "progress": 100,
-    "created_at": "2026-03-05T10:00:00Z"
-  }
+  { "id": "uuid", "filename": "contract.pdf", "status": "READY", "progress": 100, "created_at": "..." }
 ]
 ```
 
@@ -362,15 +500,20 @@ Context:
 ```json
 {
   "status": "DONE",
-  "result": {
-    "start_date": { "value": "2024-01-01", "confidence": 0.95 },
-    "end_date": { "value": "2026-12-31", "confidence": 0.92 },
-    "provider": { "value": "Acme Corp", "confidence": 0.98 },
-    "total_amount": { "value": "USD:150000.00", "confidence": 0.87 },
-    "payment_terms": { "value": "30 Days | Arrears", "confidence": 0.76 }
+  "fixed_fields": {
+    "start_date": { "value": "2024-01-01", "description": "...", "confidence": 0.95 },
+    "provider":   { "value": "Acme Corp",  "description": "...", "confidence": 0.92 }
   },
+  "dynamic_fields": {
+    "General": {
+      "contract_description": { "value": "...", "description": "...", "confidence": 0.88 }
+    },
+    "Legal terms": { ... },
+    "Commercial terms": { ... }
+  },
+  "special_fields": {},
   "sources": [
-    { "chunk_id": "uuid", "content_preview": "...", "similarity": 0.91 }
+    { "pass": "fixed", "chunk_id": "uuid", "preview": "..." }
   ]
 }
 ```
@@ -380,36 +523,32 @@ Context:
 ## Verification Checklist
 
 - [ ] `docker compose up` starts postgres with pgvector
-- [ ] Upload a PDF → 202 returned immediately
-- [ ] `GET /documents/{id}` shows status transitioning QUEUED → PROCESSING → READY
+- [ ] Upload PDF → 202 returned immediately, status=QUEUED shown in UI
+- [ ] Status transitions: QUEUED → PROCESSING (with progress %) → READY
 - [ ] `chunks` table has rows with non-null `embedding` column
-- [ ] Click Analyze → `document_analysis.status` goes RUNNING → DONE
-- [ ] `GET /documents/{id}/analysis` returns populated `result` JSON
-- [ ] UI displays extracted fields with confidence scores
+- [ ] Click Analyze → analysis status: RUNNING → DONE
+- [ ] `GET /documents/{id}/analysis` returns populated fixed_fields + dynamic_fields JSON
+- [ ] UI displays all three field sections with confidence dots
+- [ ] Ollama at http://148.113.1.127:11434 is reachable from backend
 
 ---
 
 ## Start Order
 
 ```bash
-# 1. Start DB
+# 1. Start Postgres
 docker compose up -d
 
-# 2. Start Ollama (must be running)
-ollama serve
-
-# 3. Pull models (first time)
-ollama pull nomic-embed-text
-ollama pull llama3.2
-
-# 4. Start backend
+# 2. Start backend
 cd backend
 pip install -r requirements.txt
-alembic upgrade head
-uvicorn main:app --reload
+# create tables (alembic or sqlalchemy create_all on startup)
+uvicorn main:app --reload --port 8000
 
-# 5. Start frontend
+# 3. Start frontend
 cd frontend
 npm install
 npm run dev
 ```
+
+Backend CORS must allow frontend origin (localhost:3000).
