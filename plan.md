@@ -53,12 +53,15 @@ curl http://148.113.1.127:11434/api/tags
 | id | UUID PK | |
 | filename | TEXT | original filename |
 | mime_type | TEXT | application/pdf etc |
+| file_data | BYTEA | raw uploaded file bytes (MVP: store in DB) |
 | status | TEXT | QUEUED / PROCESSING / READY / FAILED |
 | progress | INT | 0–100 |
 | error_message | TEXT nullable | |
 | raw_text | TEXT nullable | cleaned text from Kreuzberg |
 | created_at | TIMESTAMP | |
 | updated_at | TIMESTAMP | |
+
+> **File size cap**: Enforce 25MB max at upload. Supported types: PDF, DOCX only (check mime_type).
 
 ### `chunks`
 
@@ -74,10 +77,12 @@ curl http://148.113.1.127:11434/api/tags
 | metadata | JSONB nullable | extra info |
 | embedding | vector(768) | pgvector |
 
-Required index:
+Required index (use hnsw — no row-count minimum, works from day 1):
 ```sql
-CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops);
 ```
+
+> Do NOT use `ivfflat` — it requires enough rows to set `lists` correctly and breaks on small datasets.
 
 ### `document_analysis`
 
@@ -201,25 +206,29 @@ CREATE EXTENSION IF NOT EXISTS vector;
 Triggered as `BackgroundTasks` task after upload.
 
 ```
-async def ingest_document(document_id, file_bytes, filename, mime_type):
+async def ingest_document(document_id):
     try:
-        1. db: set status=PROCESSING, progress=5
-        2. kreuzberg: extract clean text from file_bytes
-           - result = await kreuzberg.extract_text_from_bytes(file_bytes, mime_type)
-           - store result.text in documents.raw_text
-        3. db: progress=30
-        4. chunk: RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
-           - chunks = splitter.split_text(raw_text)
-        5. db: progress=50
-        6. delete existing chunks for document_id (idempotency)
-        7. for each chunk:
-           - embedding = await embed(chunk_text)  # Ollama nomic-embed-text
+        1. db: fetch document (get file_data, mime_type, filename)
+        2. db: set status=PROCESSING, progress=5
+        3. kreuzberg: extract clean text
+           # Kreuzberg is SYNCHRONOUS — run in thread to not block async event loop
+           result = await asyncio.to_thread(kreuzberg.extract_text, file_data, mime_type)
+           store result in documents.raw_text
+        4. db: progress=30
+        5. chunk: RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=80)
+           chunks = splitter.split_text(raw_text)
+        6. db: progress=50
+        7. delete existing chunks for document_id (re-upload idempotency)
+        8. for each chunk (batch embeds in groups of 10 to avoid timeout):
+           - embedding = await embed(chunk_text)
            - insert row into chunks table
-        8. db: progress=90
-        9. db: status=READY, progress=100
+        9. db: progress=90
+       10. db: status=READY, progress=100
     except Exception as e:
         db: status=FAILED, error_message=str(e)
 ```
+
+> **Kreuzberg API note**: Check the exact function signature before implementing — it may be `extract_text(file_path)` rather than bytes. If so, write `file_data` to a temp file first via `tempfile.NamedTemporaryFile`.
 
 ---
 
@@ -291,7 +300,25 @@ async def ollama_generate(prompt: str) -> str:
             timeout=120
         )
     return response.json()["response"]
+
+def parse_llm_json(raw: str) -> dict:
+    """Robust JSON parser — LLMs often wrap output in markdown code fences."""
+    raw = raw.strip()
+    # Strip markdown code blocks if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Last resort: find first { ... } block
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return json.loads(match.group())
+        raise ValueError(f"Could not parse JSON from LLM response: {raw[:200]}")
 ```
+
+> Always use `parse_llm_json()` on every Ollama response — never `json.loads()` directly.
 
 ---
 
@@ -478,9 +505,11 @@ If supplier is not recognized → skip Pass 3, return empty `special_fields: {}`
 - Table: Filename | Uploaded | Status badge | Progress % | Action
 - Status badge colors: QUEUED=gray, PROCESSING=amber, READY=green, FAILED=red
 - While any doc is QUEUED or PROCESSING: poll `GET /documents` every 3 seconds
-- "Analyze" button: enabled only when READY → POST `/documents/{id}/analyze` → navigate to result page
+- "Analyze" button: enabled only when READY → POST `/documents/{id}/analyze` → navigate to `/documents/{id}`
 
 **Analysis Result (`/documents/[id]`)**:
+- On load: poll `GET /documents/{id}/analysis` every 3 seconds while `status === "RUNNING"`
+- Show spinner while RUNNING, show results when DONE, show error message when FAILED
 - Three sections: Fixed Fields, Dynamic Fields (by category), Special Fields
 - Each field row: Label | Value | Confidence dot (green ≥0.8, yellow ≥0.5, red <0.5)
 - Source chunks shown at bottom as collapsible citations
@@ -552,3 +581,50 @@ npm run dev
 ```
 
 Backend CORS must allow frontend origin (localhost:3000).
+
+Add to `main.py`:
+```python
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+---
+
+## Suggested Additions for Better Success Rate
+
+These are not required for the MVP to function, but each one meaningfully improves output quality:
+
+### 1. Ollama Connection Health Check on Startup
+Before accepting any uploads, verify Ollama is reachable:
+```python
+@app.on_event("startup")
+async def check_ollama():
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+            r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Ollama not reachable: {e}")
+```
+
+### 2. Chunk Size Tuning for Legal Docs
+The default `chunk_size=800` is generic. For contracts, try `chunk_size=600, chunk_overlap=100`. Legal clauses are typically 100–400 tokens; smaller chunks give more precise retrieval per field.
+
+### 3. Retrieve More, Not Less
+Start with `LIMIT 15` in the pgvector query (not 10). More context = fewer missed fields. You can always reduce later if the LLM context overflows.
+
+### 4. Fail Gracefully on Pass 3 (Supplier Fields)
+If supplier is not recognized (not Oracle/Microsoft/SAP/etc.), skip Pass 3 completely and store `special_fields: {}`. Do NOT let an unknown supplier break the whole analysis.
+
+### 5. Download Endpoint
+Since `file_data` is kept permanently in the DB, expose a download endpoint so users can retrieve the original file:
+
+```
+GET /documents/{id}/download
+→ Returns file_data as binary response with correct Content-Type and Content-Disposition: attachment; filename="{filename}"
+```
