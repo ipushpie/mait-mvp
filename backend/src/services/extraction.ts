@@ -52,34 +52,54 @@ export async function analyzeDocument(documentId: string): Promise<void> {
 
     logger.info(TAG, `Starting analysis`, { documentId, resumeFrom: hasPass2 ? 'Pass 3' : hasPass1 ? 'Pass 2' : 'Pass 1' });
 
-    // Pass 1: Fixed fields (skip if already saved)
-    let fixedFields: unknown;
-    if (hasPass1) {
-      fixedFields = prior!.fixedFields;
-      logger.info(TAG, `Pass 1 skipped — using existing fixedFields`, { documentId });
-    } else {
-      fixedFields = await timedPass('Pass 1 Fixed', () =>
-        runPass(documentId, FIXED_QUERY, FIXED_PROMPT)
-      );
-      await prisma.documentAnalysis.update({
-        where: { documentId },
-        data: { fixedFields: fixedFields as any, modelName: config.generationModel },
-      });
-      logger.info(TAG, `Pass 1 saved`, { documentId });
-    }
+    // Passes: try to combine Pass 1 + Pass 2 into a single LLM call when
+    // neither has been performed yet. This reduces total model latency.
+    let fixedFields: unknown = null;
+    let dynamicFields: unknown = null;
 
-    // Pass 2: Dynamic fields (skip if already saved)
-    if (hasPass2) {
-      logger.info(TAG, `Pass 2 skipped — using existing dynamicFields`, { documentId });
-    } else {
-      const dynamicFields = await timedPass('Pass 2 Dynamic', () =>
-        runPass(documentId, DYNAMIC_QUERY, DYNAMIC_PROMPT)
-      );
+    if (!hasPass1 && !hasPass2) {
+      const combined = await timedPass('Combined Pass 1+2', () => runCombinedPass(documentId));
+      // Normalize LLM output shapes so frontend always receives FieldValue objects
+      const rawFixed = (combined as any)?.fixed_fields ?? null;
+      const rawDynamic = (combined as any)?.dynamic_fields ?? null;
+      const normalizedFixed = normalizeFixedFields(rawFixed);
+      const normalizedDynamic = normalizeDynamicFields(rawDynamic);
+      fixedFields = normalizedFixed;
+      dynamicFields = normalizedDynamic;
       await prisma.documentAnalysis.update({
         where: { documentId },
-        data: { status: 'PARTIAL', dynamicFields: dynamicFields as any },
+        data: {
+          fixedFields: normalizedFixed as any,
+          dynamicFields: normalizedDynamic as any,
+          modelName: config.generationModel,
+          status: Object.keys(normalizedDynamic || {}).length > 0 ? 'PARTIAL' : 'RUNNING',
+        },
       });
-      logger.info(TAG, `Pass 2 saved (PARTIAL)`, { documentId });
+      logger.info(TAG, `Combined pass saved`, { documentId });
+    } else {
+      // Existing behavior: load or run Pass 1
+      if (hasPass1) {
+        fixedFields = prior!.fixedFields;
+        logger.info(TAG, `Pass 1 skipped — using existing fixedFields`, { documentId });
+      } else {
+        const rawFixed = await timedPass('Pass 1 Fixed', () => runPassWithAutoExpand(documentId, FIXED_QUERY, FIXED_PROMPT));
+        const normalizedFixed = normalizeFixedFields(rawFixed);
+        fixedFields = normalizedFixed;
+        await prisma.documentAnalysis.update({ where: { documentId }, data: { fixedFields: normalizedFixed as any, modelName: config.generationModel } });
+        logger.info(TAG, `Pass 1 saved`, { documentId });
+      }
+
+      // Pass 2: Dynamic fields (skip if already saved)
+      if (hasPass2) {
+        dynamicFields = prior!.dynamicFields;
+        logger.info(TAG, `Pass 2 skipped — using existing dynamicFields`, { documentId });
+      } else {
+        const rawDynamic = await timedPass('Pass 2 Dynamic', () => runPassWithAutoExpand(documentId, DYNAMIC_QUERY, DYNAMIC_PROMPT));
+        const normalizedDynamic = normalizeDynamicFields(rawDynamic);
+        dynamicFields = normalizedDynamic;
+        await prisma.documentAnalysis.update({ where: { documentId }, data: { status: Object.keys(normalizedDynamic || {}).length > 0 ? 'PARTIAL' : 'RUNNING', dynamicFields: normalizedDynamic as any } });
+        logger.info(TAG, `Pass 2 saved (PARTIAL)`, { documentId });
+      }
     }
 
     // Pass 3: Supplier-specific fields — non-fatal if it fails
@@ -123,7 +143,8 @@ async function timedPass<T>(label: string, fn: () => Promise<T>): Promise<T> {
 async function runPass(
   documentId: string,
   queryText: string,
-  promptTemplate: string
+  promptTemplate: string,
+  options?: { includeAllChunks?: boolean; chunkTruncate?: number; timeoutMs?: number; chunkLimit?: number }
 ): Promise<unknown> {
   const queryEmbedding = await getCachedEmbedding(queryText);
 
@@ -131,37 +152,93 @@ async function runPass(
     throw new Error(`Embedding returned empty vector for query: "${queryText.slice(0, 80)}"`);
   }
 
-  // pgvector cosine similarity search
-  const chunks = await prisma.$queryRawUnsafe<{ id: string; content: string }[]>(
-    `SELECT id, content FROM "Chunk"
-     WHERE "documentId" = $1
-     ORDER BY embedding <=> $2::vector
-     LIMIT 5`,
-    documentId,
-    `[${queryEmbedding.join(',')}]`
-  );
+  let chunks: { id: string; content: string }[] = [];
+  const includeAll = options?.includeAllChunks ?? config.includeAllChunksInPrompt;
+  const overrideTruncate = options?.chunkTruncate;
+
+  if (includeAll) {
+    // Include all chunks from the document (ordered) when the flag is enabled.
+    chunks = await prisma.$queryRawUnsafe<{ id: string; content: string }[]>(
+      `SELECT id, content FROM "Chunk"
+       WHERE "documentId" = $1
+       ORDER BY "chunkIndex" ASC`,
+      documentId
+    );
+  } else {
+    // pgvector cosine similarity search (default) — return top-N chunks
+    const limit = options?.chunkLimit ?? (config as any).targetChunks ?? 15;
+    chunks = await prisma.$queryRawUnsafe<{ id: string; content: string }[]>(
+      `SELECT id, content FROM "Chunk"
+       WHERE "documentId" = $1
+       ORDER BY embedding <=> $2::vector
+       LIMIT $3`,
+      documentId,
+      `[${queryEmbedding.join(',')}]`,
+      limit
+    );
+  }
 
   if (chunks.length === 0) {
     throw new Error('No chunks found for document. Has it been ingested?');
   }
 
-  const context = chunks.map((c, i) => `[${i + 1}] ${c.content}`).join('\n\n');
+  // Truncate chunk content to limit prompt size and speed up model inference
+  const CHUNK_TRUNCATE = overrideTruncate ?? 800; // chars per chunk included in prompt
+  const context = chunks
+    .map((c, i) => `[${i + 1}] ${String(c.content).slice(0, CHUNK_TRUNCATE)}`)
+    .join('\n\n');
   const currentDate = new Date().toISOString().split('T')[0];
   const prompt = promptTemplate
     .replace('{currentDate}', currentDate)
     .replace('{exclusionText}', '')
     .replace('{context}', context);
 
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const raw = await ollamaGenerateWithRetry(prompt);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const raw = await ollamaGenerateWithRetry(prompt, options?.timeoutMs);
     try {
       return parseLLMJson(raw);
     } catch (err) {
+      logger.warn(TAG, `JSON parse failed`, { attempt, maxRetries: MAX_RETRIES });
+      // Print raw model output to console for debugging
+      // eslint-disable-next-line no-console
+      console.error('LLM raw response (parse failed):\n', raw);
+
+      // Try a repair pass: give the model its original prompt and its
+      // previous output and ask it to return ONLY the valid JSON object.
+      try {
+        const repairPrompt = `Original prompt:\n${prompt}\n\nModel output:\n${raw}\n\n` +
+          'Your task: Return ONLY a single valid JSON object that satisfies the Original prompt. ' +
+          'Do NOT include any explanation, markdown, or extra text. Return a single JSON object starting with { and ending with }.';
+        const repaired = await ollamaGenerateWithRetry(repairPrompt, options?.timeoutMs);
+        // Print repair response to console as well
+        // eslint-disable-next-line no-console
+        console.error('LLM repair response:\n', repaired);
+        try {
+          return parseLLMJson(repaired);
+        } catch (repairErr) {
+          logger.warn(TAG, `Repair attempt failed to produce valid JSON`, { repairPreview: repaired.slice(0, 400) });
+        }
+      } catch (repairCallErr) {
+        logger.warn(TAG, `Repair attempt failed (LLM)`, { error: String(repairCallErr) });
+      }
+
       if (attempt === MAX_RETRIES) throw err;
-      logger.warn(TAG, `JSON parse failed, retrying`, { attempt, maxRetries: MAX_RETRIES });
     }
   }
   throw new Error('Unreachable');
+}
+
+// Helper: run the pass and if parsed fixed fields are mostly empty, retry
+// once with the full document included to give the model more context.
+async function runPassWithAutoExpand(
+  documentId: string,
+  queryText: string,
+  promptTemplate: string
+): Promise<unknown> {
+  // Always use the configured target chunk count for a single pass. Do not
+  // retry or restart the model run based on how many fields are empty.
+  const target = (config as any).targetChunks ?? 15;
+  return runPass(documentId, queryText, promptTemplate, { chunkLimit: target });
 }
 
 async function runSupplierPass(
@@ -203,43 +280,76 @@ async function runSupplierPass(
   return runPass(documentId, query, prompt);
 }
 
+async function runCombinedPass(documentId: string): Promise<unknown> {
+  const combinedQuery = `${FIXED_QUERY} ${DYNAMIC_QUERY}`;
+
+  // A concise, unambiguous combined prompt that asks for a single JSON
+  // object containing `fixed_fields` and `dynamic_fields`. Keep the
+  // structure explicit to reduce the model producing explanation text.
+  const combinedPromptTemplate = `You are a contract analysis JSON extraction engine. The current date is {currentDate}.
+
+You MUST respond with ONLY a single valid JSON object and nothing else. The JSON object MUST have exactly two top-level keys: "fixed_fields" and "dynamic_fields".
+
+"fixed_fields" should be an object containing the standard fixed fields (agreement_type, provider, client, product, total_amount, annual_amount, contract_term, start_date, end_date, payment_terms, renewal, termination, governing_law, notice_address). For any missing value, use null. For numeric amounts, use the format "CURRENCY:AMOUNT" where possible.
+
+"dynamic_fields" should be an object or array containing extracted clause summaries (key: short summary or extracted clause text).
+
+Use the following CONTEXT to extract values. If a field cannot be found, set it to null. Do NOT output any explanation, lists, or markdown — return only the JSON object.
+
+Context:
+{context}
+`;
+
+  // Pass the template (with {context}) to runPassWithAutoExpand so it can
+  // insert the actual retrieved chunks as context. The auto-expand helper
+  // will retry with all chunks if the first pass returns mostly empty fields.
+  return runPassWithAutoExpand(documentId, combinedQuery, combinedPromptTemplate);
+}
+
 const MAX_RETRIES = 2;
 
-async function ollamaGenerateWithRetry(prompt: string): Promise<string> {
+async function ollamaGenerateWithRetry(prompt: string, overrideTimeoutMs?: number): Promise<string> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const content = await ollamaGenerate(prompt);
+    const content = await ollamaGenerate(prompt, overrideTimeoutMs);
     if (content.length > 0) return content;
     logger.warn(TAG, `Empty LLM response, retrying`, { attempt, maxRetries: MAX_RETRIES });
   }
   throw new Error('Ollama returned empty response after all retries');
 }
+async function ollamaGenerate(prompt: string, overrideTimeoutMs?: number): Promise<string> {
+  // Enforce JSON-only responses using a system prompt and the chat API.
+  const systemPrompt =
+    'You are a contract analysis JSON extraction engine. ' +
+    'You MUST respond with ONLY a single valid JSON object and nothing else. ' +
+    'Do NOT explain, do not add any markdown or text. Return a single JSON object starting with { and ending with }.';
 
-async function ollamaGenerate(prompt: string): Promise<string> {
-  const response = await fetch(`${config.ollamaBaseUrl}/api/generate`, {
+  const response = await fetch(`${config.ollamaBaseUrl}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: config.generationModel,
-      prompt,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt },
+      ],
       stream: false,
-      format: 'json',
       keep_alive: -1,
       options: {
-        temperature: 0.1,
-        num_ctx: 8192,
-        num_predict: 8192,
+        temperature: config.llmTemperature,
+        num_ctx: config.llmNumCtx,
+        num_predict: config.llmNumPredict,
       },
     }),
-    signal: AbortSignal.timeout(900_000),
+    signal: AbortSignal.timeout(overrideTimeoutMs ?? config.llmTimeoutMs),
   });
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    throw new Error(`Ollama generate failed: ${response.status} ${response.statusText} - ${body}`);
+    throw new Error(`Ollama chat failed: ${response.status} ${response.statusText} - ${body}`);
   }
 
-  const data = (await response.json()) as { response?: string };
-  const content = data.response || '';
+  const data = (await response.json()) as { message?: { content: string }; response?: string };
+  const content = data.message?.content || data.response || '';
   logger.info(TAG, `Ollama response received`, { chars: content.length });
   return content;
 }
@@ -308,4 +418,67 @@ function extractProviderValue(fixedFields: unknown): string | null {
   const fields = (ff.fixed_fields || ff) as Record<string, unknown>;
   const provider = fields.provider as { value?: string } | undefined;
   return provider?.value ?? null;
+}
+
+function normalizeFixedFields(raw: unknown): Record<string, { value: string; description?: string; confidence?: number }> {
+  if (!raw) return {};
+  // If wrapped under fixed_fields key, unwrap
+  const data = (raw as any).fixed_fields ?? raw;
+  if (!data || typeof data !== 'object') return {};
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+    if (v === null || v === undefined) {
+      out[k] = { value: '' };
+    } else if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      out[k] = { value: String(v) };
+    } else if (typeof v === 'object') {
+      const vv = v as Record<string, unknown>;
+      if ('value' in vv) {
+        out[k] = { value: vv.value == null ? '' : String(vv.value), description: vv.description as string | undefined, confidence: typeof vv.confidence === 'number' ? vv.confidence : undefined };
+      } else {
+        // Fallback: stringify object
+        out[k] = { value: JSON.stringify(vv) };
+      }
+    } else {
+      out[k] = { value: String(v) };
+    }
+  }
+  return out;
+}
+
+function normalizeDynamicFields(raw: unknown): Record<string, Record<string, { value: string; description?: string; confidence?: number }>> {
+  if (!raw) return {};
+  const data = (raw as any).dynamic_fields ?? raw;
+  if (!data) return {};
+  // If it's an array of strings, turn into { clauses: { '0': {value: ...}, ... } }
+  if (Array.isArray(data)) {
+    const out: Record<string, Record<string, any>> = { clauses: {} };
+    (data as any[]).forEach((item, i) => {
+      out.clauses[String(i)] = typeof item === 'string' ? { value: item } : { value: JSON.stringify(item) };
+    });
+    return out;
+  }
+  if (typeof data === 'object') {
+    const out: Record<string, Record<string, any>> = {};
+    for (const [section, fields] of Object.entries(data as Record<string, unknown>)) {
+      if (Array.isArray(fields)) {
+        out[section] = {};
+        (fields as any[]).forEach((f, i) => {
+          out[section][String(i)] = typeof f === 'string' ? { value: f } : 'value' in (f as any) ? { value: (f as any).value ?? '' } : { value: JSON.stringify(f) };
+        });
+      } else if (typeof fields === 'object') {
+        out[section] = {};
+        for (const [k, v] of Object.entries(fields as Record<string, unknown>)) {
+          if (v === null || v === undefined) out[section][k] = { value: '' };
+          else if (typeof v === 'string') out[section][k] = { value: v };
+          else if (typeof v === 'object' && 'value' in (v as any)) out[section][k] = { value: (v as any).value ?? '' };
+          else out[section][k] = { value: JSON.stringify(v) };
+        }
+      } else {
+        out[section] = { '0': { value: String(fields) } };
+      }
+    }
+    return out;
+  }
+  return {};
 }

@@ -1,8 +1,10 @@
 import { extractBytes } from '@kreuzberg/node';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
-import { embed } from './embedding';
+import { embed, embedBatch } from './embedding';
+import { config } from '../utils/config';
 import { prisma } from '../utils/database';
 import { logger, elapsed } from '../utils/logger';
+import crypto from 'crypto';
 
 const TAG = 'Ingestion';
 
@@ -38,11 +40,14 @@ export async function ingestDocument(documentId: string): Promise<void> {
       data: { rawText, progress: 30 },
     });
 
-    // 4. Chunk
+    // 4. Chunk — compute chunk size to produce approximately TARGET_CHUNKS
     const t2 = Date.now();
+    const target = Math.max(1, (config as any).targetChunks || 15);
+    const estimatedChunkSize = Math.max(200, Math.floor(rawText.length / target));
+    const chunkOverlap = Math.min( Math.floor(estimatedChunkSize * 0.15), 200 );
     const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 600,
-      chunkOverlap: 100,
+      chunkSize: estimatedChunkSize,
+      chunkOverlap,
     });
     const chunks = await splitter.splitText(rawText);
     const totalChunks = chunks.length;
@@ -71,22 +76,22 @@ export async function ingestDocument(documentId: string): Promise<void> {
       const end = Math.min(i + BATCH, totalChunks);
       const batchTexts = chunks.slice(i, end);
       // get embeddings in parallel (limited by embedBatch concurrency)
-      const embeddingVectors = await Promise.all([].concat(await (await import('./embedding')).then(m => m.embedBatch(batchTexts))));
+      const embeddingVectors = await embedBatch(batchTexts);
 
-      // write DB rows for this batch in parallel
-      const writes = embeddingVectors.map(async (embeddingVector, j) => {
-        const idx = i + j;
-        const chunkText = batchTexts[j];
-        const chunk = await prisma.chunk.create({
-          data: { documentId, chunkIndex: idx, content: chunkText },
-        });
-        await prisma.$executeRawUnsafe(
-          `UPDATE "Chunk" SET embedding = $1::vector WHERE id = $2`,
-          `[${embeddingVector.join(',')}]`,
-          chunk.id
-        );
-      });
-      await Promise.all(writes);
+        // Bulk insert this batch including embedding to avoid create + update per-row roundtrips.
+        const placeholders: string[] = [];
+        const params: any[] = [];
+        for (let j = 0; j < embeddingVectors.length; j++) {
+          const idx = i + j;
+          const chunkText = batchTexts[j];
+          const id = crypto.randomUUID();
+          const paramBase = params.length + 1;
+          // ($n,$n+1,$n+2,$n+3,$n+4::vector)
+          placeholders.push(`($${paramBase}, $${paramBase + 1}, $${paramBase + 2}, $${paramBase + 3}, $${paramBase + 4}::vector)`);
+          params.push(id, documentId, idx, chunkText, `[${embeddingVectors[j].join(',')}]`);
+        }
+        const insertSql = `INSERT INTO "Chunk" (id, "documentId", "chunkIndex", content, embedding) VALUES ${placeholders.join(',')}`;
+        await prisma.$executeRawUnsafe(insertSql, ...params);
 
       // progress update based on last index in batch
       const lastIdx = end - 1;

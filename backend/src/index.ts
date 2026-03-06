@@ -58,21 +58,22 @@ app.listen(config.port, '0.0.0.0', async () => {
     const modelNames = data.models?.map((m) => m.name).join(', ') || 'none listed';
     logger.info('Startup', `Ollama reachable`, { models: modelNames });
 
-    // Warm up the generation model — fire-and-forget so it never competes with or delays real requests.
-    // Ollama will queue it behind any live analysis that arrives first.
-    logger.info('Startup', `Warming up model (fire-and-forget)`, { model: config.generationModel });
-    void fetch(`${config.ollamaBaseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: config.generationModel,
-        messages: [{ role: 'user', content: 'hi' }],
-        stream: false,
-        keep_alive: -1,
-      }),
-      signal: AbortSignal.timeout(300_000), // 5 minutes — large model cold-start
-    }).then(() => logger.info('Startup', `Model warmed up and loaded into VRAM`, { model: config.generationModel }))
-      .catch((e) => logger.warn('Startup', `Model warmup failed (non-fatal) — first analysis will incur cold-start delay`, { error: String(e) }));
+    // Optionally warm up the generation model (disabled by default).
+    if (config.warmupModel) {
+      logger.info('Startup', `Warming up model (fire-and-forget)`, { model: config.generationModel });
+      void fetch(`${config.ollamaBaseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: config.generationModel,
+          messages: [{ role: 'user', content: 'hello' }],
+          stream: false,
+          keep_alive: -1,
+        }),
+        signal: AbortSignal.timeout(300_000),
+      }).then(() => logger.info('Startup', `Model warmed up and loaded into VRAM`, { model: config.generationModel }))
+        .catch((e) => logger.warn('Startup', `Model warmup failed (non-fatal)`, { error: String(e) }));
+    }
   } catch (e) {
     logger.warn('Startup', 'Ollama not reachable', { error: String(e) });
   }
