@@ -23,9 +23,9 @@ WORKDIR /app
 # Copy Node.js runtime from official image
 COPY --from=builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
-    apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && \
+    apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
 # Install production dependencies
@@ -37,7 +37,11 @@ COPY prisma ./prisma
 RUN npx prisma generate
 
 # Application code
+# Copy built artifacts and dependencies from the builder stage to avoid
+# running `npm install` at runtime (prevents network/download issues
+# during image build and ensures the Prisma client binaries are present).
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
 COPY src/data ./dist/data
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh

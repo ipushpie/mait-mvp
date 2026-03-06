@@ -44,40 +44,42 @@ prisma.documentAnalysis.updateMany({
   if (r.count > 0) logger.warn('Startup', `Reset ${r.count} stuck analyses to FAILED`);
 }).catch((e) => logger.error('Startup', 'Failed to reset stuck analyses', e as Error));
 
-// Start server
-app.listen(config.port, '0.0.0.0', async () => {
-  logger.info('Startup', `Backend running on http://0.0.0.0:${config.port}`);
+// Start server only when run directly (prevents double-start when imported)
+if (require.main === module) {
+  app.listen(config.port, '0.0.0.0', async () => {
+    logger.info('Startup', `Backend running on http://0.0.0.0:${config.port}`, { pid: process.pid });
 
-  // Check Ollama connectivity
-  try {
-    const r = await fetch(`${config.ollamaBaseUrl}/api/tags`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = (await r.json()) as { models?: { name: string }[] };
-    const modelNames = data.models?.map((m) => m.name).join(', ') || 'none listed';
-    logger.info('Startup', `Ollama reachable`, { models: modelNames });
+    // Check Ollama connectivity
+    try {
+      const r = await fetch(`${config.ollamaBaseUrl}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as { models?: { name: string }[] };
+      const modelNames = data.models?.map((m) => m.name).join(', ') || 'none listed';
+      logger.info('Startup', `Ollama reachable`, { models: modelNames, pid: process.pid });
 
-    // Optionally warm up the generation model (disabled by default).
-    if (config.warmupModel) {
-      logger.info('Startup', `Warming up model (fire-and-forget)`, { model: config.generationModel });
-      void fetch(`${config.ollamaBaseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: config.generationModel,
-          messages: [{ role: 'user', content: 'hello' }],
-          stream: false,
-          keep_alive: -1,
-        }),
-        signal: AbortSignal.timeout(300_000),
-      }).then(() => logger.info('Startup', `Model warmed up and loaded into VRAM`, { model: config.generationModel }))
-        .catch((e) => logger.warn('Startup', `Model warmup failed (non-fatal)`, { error: String(e) }));
+      // Optionally warm up the generation model (disabled by default).
+      if (config.warmupModel) {
+        logger.info('Startup', `Warming up model (fire-and-forget)`, { model: config.generationModel });
+        void fetch(`${config.ollamaBaseUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: config.generationModel,
+            messages: [{ role: 'user', content: 'hello' }],
+            stream: false,
+            keep_alive: -1,
+          }),
+          signal: AbortSignal.timeout(300_000),
+        }).then(() => logger.info('Startup', `Model warmed up and loaded into VRAM`, { model: config.generationModel }))
+          .catch((e) => logger.warn('Startup', `Model warmup failed (non-fatal)`, { error: String(e) }));
+      }
+    } catch (e) {
+      logger.warn('Startup', 'Ollama not reachable', { error: String(e) });
     }
-  } catch (e) {
-    logger.warn('Startup', 'Ollama not reachable', { error: String(e) });
-  }
-});
+  });
+}
 
 // Global error handler — must be last middleware (4 args)
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
