@@ -1,0 +1,50 @@
+{
+  "oracle": {
+    "license_details": {
+      "license_type": "Type of Oracle license (e.g., Processor, Named User Plus, ULA)",
+      "csi_number": "Customer Support Identifier number",
+      "support_level": "Support tier (e.g., Premier, Extended, Sustaining)",
+      "product_name": "Oracle product name",
+      "metric_type": "License metric (Processor, NUP, etc.)",
+      "quantity": "Number of licenses",
+      "territory": "Geographic territory for license usage"
+    },
+    "entitlements": {
+      "ula_status": "Whether this is a ULA (Unlimited License Agreement)",
+      "ula_certification_date": "ULA certification deadline date",
+      "technical_support_level": "Level of technical support included",
+      "update_rights": "Software update rights included",
+      "cloud_rights": "Any cloud deployment rights"
+    }
+  },
+  "microsoft": {
+    "license_details": {
+      "agreement_type": "Type of Microsoft agreement (EA, MPSA, CSP, etc.)",
+      "enrollment_number": "Microsoft enrollment number",
+      "product_terms": "Product terms version applicable",
+      "licensing_model": "Per-user, per-device, or other model",
+      "azure_commitment": "Azure monetary commitment amount",
+      "m365_licenses": "Microsoft 365 license types and quantities"
+    },
+    "commercial_terms": {
+      "true_up_frequency": "True-up reporting frequency",
+      "price_level": "Price level (A, B, C, D)",
+      "discount_percentage": "Negotiated discount percentage",
+      "step_up_rights": "Step-up licensing rights"
+    }
+  },
+  "sap": {
+    "license_details": {
+      "license_type": "SAP license type (Named User, Engine, Package)",
+      "named_user_types": "Types of named users (Professional, Limited Professional, etc.)",
+      "named_user_count": "Number of named users by type",
+      "engine_metric": "Engine-based metric details",
+      "indirect_access": "Indirect/digital access terms"
+    },
+    "support_terms": {
+      "support_type": "Support type (Standard, Enterprise, Premium Engagement)",
+      "support_percentage": "Support fee as percentage of license fees",
+      "support_scope": "Scope of support coverage"
+    }
+  }
+}

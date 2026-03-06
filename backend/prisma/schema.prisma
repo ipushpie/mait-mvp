@@ -1,0 +1,62 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Document {
+  id           String    @id @default(uuid())
+  filename     String
+  mimeType     String
+  fileData     Bytes
+  status       String    @default("QUEUED")
+  progress     Int       @default(0)
+  errorMessage String?
+  rawText      String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  chunks   Chunk[]
+  analysis DocumentAnalysis?
+
+  @@map("Document")
+}
+
+model Chunk {
+  id           String   @id @default(uuid())
+  documentId   String
+  chunkIndex   Int
+  content      String
+  pageStart    Int?
+  pageEnd      Int?
+  sectionTitle String?
+  metadata     Json?
+  // embedding stored via raw SQL: vector(768)
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@map("Chunk")
+}
+
+model DocumentAnalysis {
+  id            String   @id @default(uuid())
+  documentId    String   @unique
+  status        String   @default("PENDING")
+  errorMessage  String?
+  fixedFields   Json?
+  dynamicFields Json?
+  specialFields Json?
+  sources       Json?
+  modelName     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@map("DocumentAnalysis")
+}

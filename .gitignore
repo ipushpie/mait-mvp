@@ -1,0 +1,17 @@
+node_modules
+dist
+.next
+.env
+*.log
+*.tgz
+pgdata
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

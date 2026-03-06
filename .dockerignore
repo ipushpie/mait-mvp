@@ -1,0 +1,13 @@
+node_modules
+dist
+.next
+.env
+*.log
+*.tgz
+.git
+.gitignore
+plan.md
+pgdata
+.DS_Store
+.vscode
+.idea
