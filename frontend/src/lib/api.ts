@@ -18,7 +18,7 @@ export interface AnalysisResult {
   errorMessage: string | null;
   fixedFields: Record<string, FieldValue> | { fixed_fields: Record<string, FieldValue> } | null;
   dynamicFields: Record<string, Record<string, FieldValue>> | { dynamic_fields: Record<string, Record<string, FieldValue>> } | null;
-  specialFields: Record<string, unknown> | null;
+  specialFields: SpecialFieldsData | { special_fields: SpecialFieldsData } | null;
   sources: unknown;
   modelName: string | null;
   createdAt: string;
@@ -30,6 +30,14 @@ export interface FieldValue {
   description?: string;
   confidence?: number;
 }
+
+export interface SpecialFieldEntry {
+  value: string | null;
+  description?: string;
+  confidence?: number;
+}
+
+export type SpecialFieldsData = Record<string, Record<string, SpecialFieldEntry>>;
 
 export async function fetchDocuments(): Promise<DocumentItem[]> {
   const res = await fetch(`${API_URL}/documents`);

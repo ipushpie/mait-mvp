@@ -1,8 +1,9 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { Agent, setGlobalDispatcher } from 'undici';
-import { config } from './config';
-import { prisma } from './database';
+import { config } from './utils/config';
+import { prisma } from './utils/database';
+import { logger } from './utils/logger';
 import documentRoutes from './routes/documents';
 import analysisRoutes from './routes/analysis';
 
@@ -18,7 +19,7 @@ setGlobalDispatcher(
 const app = express();
 
 // Middleware
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '30mb' }));
 
 // Routes
@@ -35,17 +36,17 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// Reset any analyses stuck in RUNNING state (from previous container crashes)
+// Reset any analyses stuck in RUNNING or PARTIAL state (from previous container crashes)
 prisma.documentAnalysis.updateMany({
-  where: { status: 'RUNNING' },
+  where: { status: { in: ['RUNNING', 'PARTIAL'] } },
   data: { status: 'FAILED', errorMessage: 'Server restarted while analysis was in progress. Please re-trigger.' },
 }).then((r) => {
-  if (r.count > 0) console.log(`Reset ${r.count} stuck RUNNING analyses to FAILED`);
-}).catch(console.error);
+  if (r.count > 0) logger.warn('Startup', `Reset ${r.count} stuck analyses to FAILED`);
+}).catch((e) => logger.error('Startup', 'Failed to reset stuck analyses', e as Error));
 
 // Start server
 app.listen(config.port, '0.0.0.0', async () => {
-  console.log(`Backend running on http://0.0.0.0:${config.port}`);
+  logger.info('Startup', `Backend running on http://0.0.0.0:${config.port}`);
 
   // Check Ollama connectivity
   try {
@@ -55,10 +56,34 @@ app.listen(config.port, '0.0.0.0', async () => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = (await r.json()) as { models?: { name: string }[] };
     const modelNames = data.models?.map((m) => m.name).join(', ') || 'none listed';
-    console.log(`Ollama reachable. Models: ${modelNames}`);
+    logger.info('Startup', `Ollama reachable`, { models: modelNames });
+
+    // Warm up the generation model — fire-and-forget so it never competes with or delays real requests.
+    // Ollama will queue it behind any live analysis that arrives first.
+    logger.info('Startup', `Warming up model (fire-and-forget)`, { model: config.generationModel });
+    void fetch(`${config.ollamaBaseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: config.generationModel,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+        keep_alive: -1,
+      }),
+      signal: AbortSignal.timeout(300_000), // 5 minutes — large model cold-start
+    }).then(() => logger.info('Startup', `Model warmed up and loaded into VRAM`, { model: config.generationModel }))
+      .catch((e) => logger.warn('Startup', `Model warmup failed (non-fatal) — first analysis will incur cold-start delay`, { error: String(e) }));
   } catch (e) {
-    console.warn('Ollama not reachable:', e);
+    logger.warn('Startup', 'Ollama not reachable', { error: String(e) });
   }
+});
+
+// Global error handler — must be last middleware (4 args)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  logger.error('HTTP', err.message, err);
+  const status = (err as any).status ?? (err as any).statusCode ?? 500;
+  res.status(status).json({ error: err.message || 'Internal server error' });
 });
 
 export default app;

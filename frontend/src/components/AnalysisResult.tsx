@@ -1,6 +1,6 @@
 'use client';
 
-import { FieldValue } from '@/lib/api';
+import { FieldValue, SpecialFieldEntry, SpecialFieldsData } from '@/lib/api';
 
 interface AnalysisResultProps {
   fixedFields: Record<string, FieldValue> | { fixed_fields: Record<string, FieldValue> } | null;
@@ -8,7 +8,7 @@ interface AnalysisResultProps {
     | Record<string, Record<string, FieldValue>>
     | { dynamic_fields: Record<string, Record<string, FieldValue>> }
     | null;
-  specialFields: Record<string, unknown> | null;
+  specialFields: SpecialFieldsData | { special_fields: SpecialFieldsData } | null;
 }
 
 function ConfidenceDot({ confidence }: { confidence?: number }) {
@@ -48,7 +48,7 @@ export function AnalysisResultView({ fixedFields, dynamicFields, specialFields }
     : null;
 
   const special = specialFields
-    ? (specialFields as { special_fields?: Record<string, unknown> }).special_fields || specialFields
+    ? (specialFields as { special_fields?: SpecialFieldsData }).special_fields || (specialFields as SpecialFieldsData)
     : null;
 
   return (
@@ -90,16 +90,42 @@ export function AnalysisResultView({ fixedFields, dynamicFields, specialFields }
       {special && Object.keys(special).length > 0 && (
         <div className="card">
           <h2>Supplier-Specific Fields</h2>
-          <pre style={{
-            background: 'var(--bg)',
-            padding: '1rem',
-            borderRadius: '8px',
-            overflow: 'auto',
-            fontSize: '0.85rem',
-            color: 'var(--muted)',
-          }}>
-            {JSON.stringify(special, null, 2)}
-          </pre>
+          {Object.entries(special as SpecialFieldsData).map(([supplierName, fields]) => (
+            <div key={supplierName} style={{ marginBottom: '1.5rem' }}>
+              <h3 style={{ textTransform: 'capitalize', marginBottom: '0.75rem' }}>
+                {supplierName} Entitlement Fields
+              </h3>
+              {fields && typeof fields === 'object' && Object.keys(fields).length > 0 ? (
+                Object.entries(fields).map(([key, field]) => {
+                  const f = field as SpecialFieldEntry;
+                  return (
+                    <div
+                      key={key}
+                      className="field-grid"
+                      style={{ padding: '0.5rem 0', borderBottom: '1px solid var(--border)' }}
+                    >
+                      <div className="field-label">{key.replace(/_/g, ' ')}</div>
+                      <div className="field-value">
+                        {f.value !== null && f.value !== undefined && f.value !== ''
+                          ? String(f.value)
+                          : 'N/A'}
+                        {f.description && (
+                          <div style={{ fontSize: '0.75rem', color: 'var(--muted)', marginTop: '0.2rem' }}>
+                            {f.description}
+                          </div>
+                        )}
+                      </div>
+                      <div><ConfidenceDot confidence={f.confidence} /></div>
+                    </div>
+                  );
+                })
+              ) : (
+                <p style={{ color: 'var(--muted)', fontSize: '0.85rem', padding: '0.5rem 0' }}>
+                  No supplier-specific fields extracted
+                </p>
+              )}
+            </div>
+          ))}
         </div>
       )}
 

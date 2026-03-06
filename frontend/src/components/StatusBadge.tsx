@@ -15,6 +15,9 @@ export function StatusBadge({ status }: { status: string }) {
     case 'done':
       className += 'badge-ready';
       break;
+    case 'partial':
+      className += 'badge-running';
+      break;
     case 'failed':
       className += 'badge-failed';
       break;

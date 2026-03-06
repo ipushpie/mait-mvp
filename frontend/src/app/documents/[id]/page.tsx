@@ -40,6 +40,7 @@ export default function DocumentDetailPage() {
     const shouldPoll =
       analysis?.status === 'RUNNING' ||
       analysis?.status === 'PENDING' ||
+      analysis?.status === 'PARTIAL' ||
       doc?.status === 'QUEUED' ||
       doc?.status === 'PROCESSING';
 
@@ -143,11 +144,13 @@ export default function DocumentDetailPage() {
             )}
           </div>
 
-          {analysis.status === 'RUNNING' && (
-            <div className="card" style={{ textAlign: 'center' }}>
-              <div className="spinner" style={{ marginBottom: '0.75rem' }} />
-              <p style={{ color: 'var(--muted)' }}>
-                Analyzing contract with AI... This may take a minute.
+          {(analysis.status === 'RUNNING' || analysis.status === 'PARTIAL') && (
+            <div className="card" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+              <div className="spinner" style={{ flexShrink: 0 }} />
+              <p style={{ color: 'var(--muted)', margin: 0 }}>
+                {analysis.status === 'RUNNING'
+                  ? 'Running analysis passes... results will appear as each pass completes.'
+                  : 'Pass 1 & 2 complete — fetching supplier-specific fields (Pass 3)...'}
               </p>
             </div>
           )}
@@ -156,7 +159,7 @@ export default function DocumentDetailPage() {
             <div className="error-box">{analysis.errorMessage}</div>
           )}
 
-          {analysis.status === 'DONE' && (
+          {(analysis.fixedFields || analysis.dynamicFields || analysis.specialFields) && (
             <AnalysisResultView
               fixedFields={analysis.fixedFields}
               dynamicFields={analysis.dynamicFields}
